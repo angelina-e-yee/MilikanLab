@@ -1,21 +1,31 @@
 # compute_q_method2_slip.py
 import numpy as np
 import pandas as pd
+import math
 
 # ---------- Lab constants (SI) ----------
 RHO_OIL  = 875.3        # kg/m^3
 RHO_AIR  = 1.204        # kg/m^3
-ETA      = 1.827e-5     # Pa·s
+ETA      = 1.827e-5     # Pa·s  (used only to get r from v_d)
 G        = 9.80         # m/s^2
 D_PLATE  = 6.0e-3       # m  (plate separation)
-BETA     = 1.061e-7     # m  (b/p from your lab sheet)
+BETA     = 1.061e-7     # m  (Cunningham b/p)
 E_CHARGE = 1.602176634e-19  # C
 
+# ---------- Uncertainties ----------
+SIG_RHO_OIL = 0.44       # kg/m^3
+SIG_RHO_AIR = 0.001      # kg/m^3
+SIG_G       = 0.10       # m/s^2
+SIG_D_PLATE = 0.05e-3    # m
+DEFAULT_SIG_VRISE = 1.0  # V
+
+# ---------- Files ----------
 VEL_CSV  = "droplet_velocities_final_V3.csv"
 VOLT_CSV = "droplet_voltages.csv"
 OUT_CSV  = "Q_method2_V3.csv"
 
 DELTA_RHO = RHO_OIL - RHO_AIR
+SIG_DELTA_RHO = math.hypot(SIG_RHO_OIL, SIG_RHO_AIR)
 
 # ---------- Shared helpers (same style as Method 1) ----------
 def radius_iter_vd(vd, n_iter=3):
@@ -27,12 +37,12 @@ def radius_iter_vd(vd, n_iter=3):
     if not np.isfinite(vd) or vd <= 0:
         return np.nan, np.nan
     # Stokes seed (no slip)
-    r = np.sqrt(9.0 * ETA * vd / (2.0 * DELTA_RHO * G))
+    r = math.sqrt(max(1e-30, 9.0 * ETA * vd / (2.0 * DELTA_RHO * G)))
     eta_eff = ETA
     for _ in range(n_iter):
         r = max(r, 1e-12)
         eta_eff = ETA / (1.0 + BETA / r)
-        r = np.sqrt(9.0 * eta_eff * vd / (2.0 * DELTA_RHO * G))
+        r = math.sqrt(max(1e-30, 9.0 * eta_eff * vd / (2.0 * DELTA_RHO * G)))
     return r, eta_eff
 
 def q_method2_from_v(r, vd, vu, Vrise):
@@ -46,41 +56,30 @@ def q_method2_from_v(r, vd, vu, Vrise):
         return np.nan
     return (4.0/3.0) * np.pi * (r**3) * DELTA_RHO * G * D_PLATE * (vd + vu) / (Vrise * vd)
 
-def q_unc_from_vstderr_method2(vd, vd_se, vu, vu_se, Vrise):
+# ---------- Direct uncertainty for Method 2 (matches your formula) ----------
+def q_unc_method2_total(q, vd, vd_se, vu, vu_se, Vrise, Vrise_se):
     """
-    Uncertainty in q from velocity uncertainties only (finite differences),
-    with slip re-evaluated each time via radius_iter_vd.
+    Implements (σ_q/q)^2 =
+        (σ_vd^2 + σ_vu^2)/(vd + vu)^2   +   (σ_vd/vd)^2
+      + (σ_Vrise/Vrise)^2  +  (σ_g/g)^2  +  (σ_d/d)^2  +  (σ_Δρ/Δρ)^2
+    Returns absolute σ_q.
     """
-    # Guard
-    good = all(np.isfinite(x) for x in [vd, vd_se, vu, vu_se, Vrise]) and vd > 0 and Vrise > 0
-    if not good or vd_se <= 0 or vu_se <= 0:
+    good = all(np.isfinite(x) for x in [q, vd, vd_se, vu, vu_se, Vrise, Vrise_se])
+    if (not good) or (q <= 0) or (vd <= 0) or (Vrise <= 0):
         return np.nan
 
-    # Central q at (vd, vu)
-    r0, _ = radius_iter_vd(vd)
-    q0 = q_method2_from_v(r0, vd, vu, Vrise)
+    term_velsum = (vd_se**2 + vu_se**2) / max((vd + vu)**2, 1e-30)
+    term_vd     = (vd_se / max(vd, 1e-30))**2
+    term_Vr     = (Vrise_se / max(Vrise, 1e-30))**2
+    term_g      = (SIG_G / max(G, 1e-30))**2
+    term_d      = (SIG_D_PLATE / max(D_PLATE, 1e-30))**2
+    term_drho   = (SIG_DELTA_RHO / max(DELTA_RHO, 1e-30))**2
 
-    # Perturb vd
-    vd_p = vd + vd_se
-    vd_m = max(vd - vd_se, 1e-12)
-    r_p, _ = radius_iter_vd(vd_p)
-    r_m, _ = radius_iter_vd(vd_m)
-    q_vd_p = q_method2_from_v(r_p, vd_p, vu, Vrise)
-    q_vd_m = q_method2_from_v(r_m, vd_m, vu, Vrise)
-    dq_d_vd = 0.5 * abs(q_vd_p - q_vd_m)
-
-    # Perturb vu (radius depends on vd only)
-    q_vu_p = q_method2_from_v(r0, vd, vu + vu_se, Vrise)
-    q_vu_m = q_method2_from_v(r0, vd, vu - vu_se, Vrise)
-    dq_d_vu = 0.5 * abs(q_vu_p - q_vu_m)
-
-    # Combine in quadrature
-    return np.sqrt(dq_d_vd**2 + dq_d_vu**2)
+    frac_var = term_velsum + term_vd + term_Vr + term_g + term_d + term_drho
+    return abs(q) * math.sqrt(frac_var)
 
 def estimate_elementary_charge(q_values, e_min=0.5e-19, e_max=2.0e-19, n_steps=5000):
-    """
-    Same GCD finder as Method 1. Returns (e_best, residual_score).
-    """
+    """Same GCD finder as Method 1. Returns (e_best, residual_score)."""
     q_values = np.asarray(q_values)
     q_values = q_values[np.isfinite(q_values) & (q_values > 0)]
     if len(q_values) < 3:
@@ -108,25 +107,32 @@ for c in need:
     if c not in vels.columns:
         raise ValueError(f"Required column '{c}' missing from {VEL_CSV}")
 
+# Rise voltage and its uncertainty (column optional)
+if "voltage_rise_sigma" in vols.columns:
+    vols["voltage_rise_sigma"] = pd.to_numeric(vols["voltage_rise_sigma"], errors="coerce")
+else:
+    vols["voltage_rise_sigma"] = DEFAULT_SIG_VRISE
+
 df = vels.merge(
-    vols[["droplet_number", "voltage_rise"]],
+    vols[["droplet_number", "voltage_rise", "voltage_rise_sigma"]],
     on="droplet_number",
     how="left"
 )
 
-# ---------- Compute r (from vd with slip), then q_method2 ----------
-vd    = pd.to_numeric(df["v_down_mps_wls"], errors="coerce").to_numpy(float)
-vu    = pd.to_numeric(df["v_up_mps_wls"],   errors="coerce").to_numpy(float)
-vd_se = pd.to_numeric(df["v_down_stderr_wls"], errors="coerce").to_numpy(float)
-vu_se = pd.to_numeric(df["v_up_stderr_wls"],   errors="coerce").to_numpy(float)
-Vrise = pd.to_numeric(df["voltage_rise"], errors="coerce").to_numpy(float)
+# ---------- Compute r (from vd with slip), then q_method2 + σ_q ----------
+vd     = pd.to_numeric(df["v_down_mps_wls"], errors="coerce").to_numpy(float)
+vu     = pd.to_numeric(df["v_up_mps_wls"],   errors="coerce").to_numpy(float)
+vd_se  = pd.to_numeric(df["v_down_stderr_wls"], errors="coerce").to_numpy(float)
+vu_se  = pd.to_numeric(df["v_up_stderr_wls"],   errors="coerce").to_numpy(float)
+Vrise  = pd.to_numeric(df["voltage_rise"], errors="coerce").to_numpy(float)
+Vrise_se = pd.to_numeric(df["voltage_rise_sigma"], errors="coerce").to_numpy(float)
 
 r_list, eta_eff_list, q_list, q_se_list = [], [], [], []
 
-for v_d, v_u, se_d, se_u, Vr in zip(vd, vu, vd_se, vu_se, Vrise):
-    r, eta_eff = radius_iter_vd(v_d)
+for v_d, v_u, se_d, se_u, Vr, Vr_se in zip(vd, vu, vd_se, vu_se, Vrise, Vrise_se):
+    r, eta_eff = radius_iter_vd(v_d)            # only to evaluate q formula
     q = q_method2_from_v(r, v_d, v_u, Vr)
-    q_se = q_unc_from_vstderr_method2(v_d, se_d, v_u, se_u, Vr)
+    q_se = q_unc_method2_total(q, v_d, se_d, v_u, se_u, Vr, Vr_se)
     r_list.append(r)
     eta_eff_list.append(eta_eff)
     q_list.append(q)
@@ -145,23 +151,19 @@ out = pd.DataFrame({
     "v_down_stderr_mps_wls": vd_se,
     "v_up_stderr_mps_wls": vu_se,
     "V_rise_V": Vrise,
+    "V_rise_sigma_V": Vrise_se,
     "r_m_slip": r_list,
     "eta_eff_Pa_s": eta_eff_list,
     "q_C_method2_slip": q_list,
-    "q_stderr_C_from_v": q_se_list,
+    "q_stderr_C_total": q_se_list,   # <-- total σ_q (this is the one to use)
     "n_e_estimate": np.array(q_list) / E_CHARGE
 })
 
-# ---- (Optional) Filter to good fits only for sanity checks ----
-# good_mask = (out["ok_down"] == True) & (out["ok_up"] == True)
-# out = out[good_mask]
-
-# ---- Rename to mirror your Method 1 renames ----
+# ---- Rename to mirror Method 1 renames ----
 out = out.rename(columns={
     "r_m_slip": "radius",
     "eta_eff_Pa_s": "effective_viscosity",
-    "q_C_method2_slip": "q_method2",
-    "q_stderr_C_from_v": "q_unc_from_v"
+    "q_C_method2_slip": "q_method2"
 })
 
 out.to_csv(OUT_CSV, index=False)
@@ -190,10 +192,11 @@ summary = pd.DataFrame([{
     "v_down_stderr_mps_wls": "",
     "v_up_stderr_mps_wls": "",
     "V_rise_V": "",
+    "V_rise_sigma_V": "",
     "radius": "",
     "effective_viscosity": "",
     "q_method2": e_est,
-    "q_unc_from_v": "",
+    "q_stderr_C_total": "",
     "n_e_estimate": e_est / E_CHARGE
 }])
 out = pd.concat([out, summary], ignore_index=True)
